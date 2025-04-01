@@ -31,6 +31,8 @@ class Visualizer(nn.Module):
             video = self.plot_overlay(data, mode)
         elif "spaghetti" in mode:
             video = self.plot_spaghetti(data, mode)
+        elif "warp" in mode:
+            video = self.plot_warp(data, mode)
         else:
             raise ValueError(f"Unknown mode {mode}")
         save_path = osp.join(self.result_path, mode) + ".mp4" if self.save_mode == "video" else ""
@@ -74,6 +76,142 @@ class Visualizer(nn.Module):
             # Convert from H W C to C H W
             tgt_frame = tgt_frame.permute(2, 0, 1)
             video.append(tgt_frame)
+        video = torch.stack(video)
+        return video
+
+    def plot_warp(self, data, mode):
+        """Warp the first frame to match subsequent frames using tracking data."""
+        T, C, H, W = data["video"].shape
+        tracks = data["tracks"]
+        
+        # Get the first frame that we'll warp
+        first_frame = data["video"][0].permute(1, 2, 0)  # H, W, C
+        
+        # Create a regular grid for sampling
+        grid = get_grid(H, W).cuda()
+        
+        video = []
+        for tgt_step in tqdm(range(T), leave=False, desc="Warping first frame"):
+            # Skip first frame (just display it as is)
+            if tgt_step == 0:
+                video.append(data["video"][0])
+                continue
+                
+            # Get tracks for current frame
+            tgt_tracks = tracks[tgt_step]
+            
+            if tracks.ndim == 4:  # Full dense tracks for every pixel (T, H, W, 3)
+                # Create backward flow grid: where does each pixel in current frame come from in first frame?
+                flow_grid = torch.zeros((H, W, 2), device=tracks.device)
+                
+                # Extract positions and visibility
+                src_points = tracks[0, ..., :2]    # positions in first frame
+                tgt_points = tgt_tracks[..., :2]   # positions in current frame
+                tgt_vis = tgt_tracks[..., 2] > 0.5 # visibility in current frame
+                
+                # Create a grid that maps from target back to source
+                # For each position in the target frame, find where it comes from in the source frame
+                for h in range(H):
+                    for w in range(W):
+                        if tgt_vis[h, w]:
+                            # Normalize coordinates to [-1, 1] for grid_sample
+                            src_x = 2.0 * src_points[h, w, 0] - 1.0
+                            src_y = 2.0 * src_points[h, w, 1] - 1.0
+                            flow_grid[h, w, 0] = src_x
+                            flow_grid[h, w, 1] = src_y
+                
+                # Create a mask for valid pixels
+                valid_mask = tgt_vis.float()[..., None].expand(-1, -1, 2)
+                
+                # Use nearest neighbor filling for invisible pixels
+                # This is a simple approach - could be improved with more sophisticated inpainting
+                from scipy.ndimage import distance_transform_edt
+                
+                # Convert to numpy for processing
+                valid_mask_np = valid_mask[..., 0].cpu().numpy()
+                flow_grid_np = flow_grid.cpu().numpy()
+                
+                # Find distance to nearest valid pixel
+                dist_transform = distance_transform_edt(1 - valid_mask_np)
+                
+                # For each invalid pixel, find nearest valid pixel
+                for h in range(H):
+                    for w in range(W):
+                        if not valid_mask_np[h, w]:
+                            # Find nearest valid pixel
+                            y, x = np.unravel_index(np.argmin(dist_transform + valid_mask_np * H * W), (H, W))
+                            flow_grid_np[h, w] = flow_grid_np[y, x]
+                
+                # Convert back to tensor
+                flow_grid = torch.from_numpy(flow_grid_np).to(tracks.device)
+                
+            else:  # Sparse tracks (T, N, 3)
+                # For sparse tracks, we'll interpolate to get dense flow
+                src_points = tracks[0, :, :2]  # N, 2
+                tgt_points = tgt_tracks[:, :2]  # N, 2
+                tgt_vis = tgt_tracks[:, 2] > 0.5  # N
+                
+                # Only use visible points
+                src_points = src_points[tgt_vis]
+                tgt_points = tgt_points[tgt_vis]
+                
+                # Convert to pixel coordinates
+                src_points_px = src_points.clone()
+                src_points_px[:, 0] = src_points_px[:, 0] * (W - 1)
+                src_points_px[:, 1] = src_points_px[:, 1] * (H - 1)
+                
+                tgt_points_px = tgt_points.clone()
+                tgt_points_px[:, 0] = tgt_points_px[:, 0] * (W - 1)
+                tgt_points_px[:, 1] = tgt_points_px[:, 1] * (H - 1)
+                
+                # Create a regular grid
+                y_coords, x_coords = torch.meshgrid(torch.arange(H, device=tracks.device), 
+                                                   torch.arange(W, device=tracks.device))
+                tgt_coords = torch.stack([x_coords.flatten(), y_coords.flatten()], dim=1).float()  # HW, 2
+                
+                # For each target position, find K nearest source points
+                K = min(5, len(src_points_px))
+                flow_grid = torch.zeros((H*W, 2), device=tracks.device)
+                
+                for i in range(H*W):
+                    # Calculate distances to all tracked points
+                    dists = torch.sum((tgt_coords[i].unsqueeze(0) - tgt_points_px) ** 2, dim=1)
+                    
+                    # Get K nearest neighbors
+                    k_indices = torch.topk(dists, k=K, largest=False).indices
+                    
+                    # Get weights based on distance (inverse distance weighting)
+                    weights = 1.0 / (dists[k_indices] + 1e-6)
+                    weights = weights / weights.sum()
+                    
+                    # Weighted average of source positions
+                    src_pos = torch.sum(weights.unsqueeze(1) * src_points[k_indices], dim=0)
+                    
+                    # Convert to grid coordinates [-1, 1]
+                    flow_grid[i, 0] = 2.0 * src_pos[0] - 1.0
+                    flow_grid[i, 1] = 2.0 * src_pos[1] - 1.0
+                
+                flow_grid = flow_grid.reshape(H, W, 2)
+            
+            # Perform the warping using grid_sample
+            first_frame_tensor = first_frame.permute(2, 0, 1).unsqueeze(0)  # Add batch dimension
+            warped_frame = torch.nn.functional.grid_sample(
+                first_frame_tensor, 
+                flow_grid.unsqueeze(0),  # Add batch dimension
+                mode='bilinear',
+                align_corners=True
+            )
+            
+            # Get the current frame to blend with for occlusions
+            current_frame = data["video"][tgt_step].unsqueeze(0)
+            
+            # For areas where the track is not visible (occluded), use the current frame
+            if tracks.ndim == 4:
+                blend_mask = tgt_tracks[..., 2].unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+                warped_frame = blend_mask * warped_frame + (1 - blend_mask) * current_frame
+            
+            video.append(warped_frame[0])  # Remove batch dimension
+        
         video = torch.stack(video)
         return video
 
