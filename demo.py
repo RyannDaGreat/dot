@@ -134,16 +134,27 @@ class Visualizer(nn.Module):
             else:  # Sparse tracks (T, N, 3)
                 pass # Already setup above
             
-            # Create a black background for warped frame
-            black_bg = torch.zeros_like(tgt_frame)
+            # Create a gray background (0.2) for warped frame
+            gray_bg = torch.ones_like(tgt_frame) * 0.2
             
-            # Draw just the warped points on black background
-            warp_img = black_bg.clone().permute(1, 2, 0)  # H, W, C
+            # Draw just the warped points on gray background
+            warp_img = gray_bg.clone().permute(1, 2, 0)  # H, W, C
             
             # Draw the warped points with original colors
             if tgt_vis.bool().any():
-                warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W, radius=2)  # Slightly bigger radius for visibility
-                warp_img = alpha * warp
+                # Debug color ranges - only print for first frame
+                if tgt_step == 1:
+                    print(f"Color range: {src_col.min().item():.4f} to {src_col.max().item():.4f}")
+                    print(f"Shape of src_col: {src_col.shape}")
+                
+                # Force color range to be visible
+                src_col = torch.clamp(src_col, 0.1, 1.0)  # Ensure nothing is completely black
+                
+                # Increase the radius for better visibility
+                warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W, radius=3)  # Bigger radius for visibility
+                
+                # Only show where we have points
+                warp_img = alpha * warp + (1-alpha) * warp_img
             
             warp_img = warp_img.permute(2, 0, 1)  # Back to C, H, W
             
