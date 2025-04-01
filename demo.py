@@ -81,7 +81,7 @@ class Visualizer(nn.Module):
 
     def plot_warp(self, data, mode):
         """Warp the first frame to match subsequent frames using tracking data.
-        Similar to overlay, but uses colors from the first frame instead of rainbow colors."""
+        Shows original video on top and warped first frame on black background on bottom."""
         T, C, H, W = data["video"].shape
         mask = data["mask"] if "mask" in mode else torch.ones_like(data["mask"])
         tracks = data["tracks"]
@@ -108,7 +108,6 @@ class Visualizer(nn.Module):
         video = []
         for tgt_step in tqdm(range(T), leave=False, desc="Warping first frame"):
             tgt_frame = data["video"][tgt_step]
-            tgt_frame = tgt_frame.permute(1, 2, 0)
             
             # Get positions in target frame
             tgt_pos = tracks[tgt_step, ..., :2]
@@ -132,27 +131,26 @@ class Visualizer(nn.Module):
                 )  # [1, C, N, 1]
                 src_col = src_col.squeeze(0).squeeze(-1).permute(1, 0)  # [N, C]
                 
-                # Draw first frame colors at target positions
-                warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W)
             else:  # Sparse tracks (T, N, 3)
-                # Draw first frame colors at target positions
-                warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W)
+                pass # Already setup above
             
-            # Handle occlusion areas with stripes if needed
-            if "stripes" in mode:
-                warp_occ, alpha_occ = draw(tgt_pos, 1 - tgt_vis, src_col, H, W)
-                stripes = torch.arange(H, device=tracks.device).view(-1, 1) + torch.arange(W, device=tracks.device).view(1, -1)
-                stripes = stripes % 9 < 3
-                warp_occ[stripes] = 1.
-                warp = alpha * warp + (1 - alpha) * warp_occ
-                alpha = alpha + (1 - alpha) * alpha_occ
+            # Create a black background for warped frame
+            black_bg = torch.zeros_like(tgt_frame)
             
-            # Overlay warped points over target frame
-            tgt_frame = self.overlay_factor * alpha * warp + (1 - self.overlay_factor * alpha) * tgt_frame
+            # Draw just the warped points on black background
+            warp_img = black_bg.clone().permute(1, 2, 0)  # H, W, C
             
-            # Convert from H W C to C H W
-            tgt_frame = tgt_frame.permute(2, 0, 1)
-            video.append(tgt_frame)
+            # Draw the warped points with original colors
+            if tgt_vis.bool().any():
+                warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W, radius=2)  # Slightly bigger radius for visibility
+                warp_img = alpha * warp
+            
+            warp_img = warp_img.permute(2, 0, 1)  # Back to C, H, W
+            
+            # Stack the original frame on top and warped frame on bottom
+            combined = torch.cat([tgt_frame, warp_img], dim=1)  # Stack along height dimension
+            
+            video.append(combined)
             
         video = torch.stack(video)
         return video
