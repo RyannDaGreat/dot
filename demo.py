@@ -89,21 +89,21 @@ class Visualizer(nn.Module):
         # Get colors from the first frame
         first_frame = data["video"][0]
         
-        # For sparse tracks, use colors from first frame at tracked points
+        # Get source positions and colors efficiently
         if tracks.ndim == 3:  # Sparse tracks (T, N, 3)
             # Get positions in first frame
             src_pos = tracks[0, :, :2]  # N, 2
             
-            # Get colors from first frame at these positions
-            src_pos_px = src_pos.clone()
-            src_pos_px[:, 0] = torch.clamp(src_pos_px[:, 0] * (W - 1), 0, W-1)
-            src_pos_px[:, 1] = torch.clamp(src_pos_px[:, 1] * (H - 1), 0, H-1)
-            
-            # Sample colors from first frame
-            src_col = torch.zeros((src_pos.size(0), 3), device=src_pos.device)
-            for i in range(src_pos.size(0)):
-                x, y = int(src_pos_px[i, 0]), int(src_pos_px[i, 1])
-                src_col[i] = first_frame[:, y, x]
+            # Sample colors from first frame using grid_sample (vectorized)
+            src_pos_norm = 2.0 * src_pos - 1.0  # Normalize to [-1, 1] for grid_sample
+            grid = src_pos_norm.view(1, -1, 1, 2)  # [1, N, 1, 2]
+            src_col = torch.nn.functional.grid_sample(
+                first_frame.unsqueeze(0),  # [1, C, H, W]
+                grid,
+                mode='nearest',
+                align_corners=True
+            )  # [1, C, N, 1]
+            src_col = src_col.squeeze(0).squeeze(-1).permute(1, 0)  # [N, C]
         
         video = []
         for tgt_step in tqdm(range(T), leave=False, desc="Warping first frame"):
@@ -118,17 +118,19 @@ class Visualizer(nn.Module):
                 tgt_pos = tgt_pos[mask]
                 tgt_vis = tgt_vis[mask]
                 
-                # Get colors from first frame at these positions
+                # Get colors from first frame using positions from first frame
                 src_pos = tracks[0, ..., :2][mask]
-                src_pos_px = src_pos.clone()
-                src_pos_px[:, 0] = torch.clamp(src_pos_px[:, 0] * (W - 1), 0, W-1)
-                src_pos_px[:, 1] = torch.clamp(src_pos_px[:, 1] * (H - 1), 0, H-1)
                 
-                # Sample colors from first frame
-                src_col = torch.zeros((src_pos.size(0), 3), device=src_pos.device)
-                for i in range(src_pos.size(0)):
-                    x, y = int(src_pos_px[i, 0]), int(src_pos_px[i, 1])
-                    src_col[i] = first_frame[:, y, x]
+                # Sample colors from first frame using grid_sample (vectorized)
+                src_pos_norm = 2.0 * src_pos - 1.0  # Normalize to [-1, 1] for grid_sample
+                grid = src_pos_norm.view(1, -1, 1, 2)  # [1, N, 1, 2]
+                src_col = torch.nn.functional.grid_sample(
+                    first_frame.unsqueeze(0),  # [1, C, H, W]
+                    grid,
+                    mode='nearest',
+                    align_corners=True
+                )  # [1, C, N, 1]
+                src_col = src_col.squeeze(0).squeeze(-1).permute(1, 0)  # [N, C]
                 
                 # Draw first frame colors at target positions
                 warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W)
@@ -139,7 +141,7 @@ class Visualizer(nn.Module):
             # Handle occlusion areas with stripes if needed
             if "stripes" in mode:
                 warp_occ, alpha_occ = draw(tgt_pos, 1 - tgt_vis, src_col, H, W)
-                stripes = torch.arange(H).view(-1, 1) + torch.arange(W).view(1, -1)
+                stripes = torch.arange(H, device=tracks.device).view(-1, 1) + torch.arange(W, device=tracks.device).view(1, -1)
                 stripes = stripes % 9 < 3
                 warp_occ[stripes] = 1.
                 warp = alpha * warp + (1 - alpha) * warp_occ
