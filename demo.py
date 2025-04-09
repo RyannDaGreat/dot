@@ -89,74 +89,64 @@ class Visualizer(nn.Module):
         # Get colors from the first frame
         first_frame = data["video"][0]
         
-        # Get source positions and colors efficiently
-        if tracks.ndim == 3:  # Sparse tracks (T, N, 3)
-            # Get positions in first frame
-            src_pos = tracks[0, :, :2]  # N, 2
-            
-            # Sample colors from first frame using grid_sample (vectorized)
-            src_pos_norm = 2.0 * src_pos - 1.0  # Normalize to [-1, 1] for grid_sample
-            grid = src_pos_norm.view(1, -1, 1, 2)  # [1, N, 1, 2]
-            src_col = torch.nn.functional.grid_sample(
-                first_frame.unsqueeze(0),  # [1, C, H, W]
-                grid,
-                mode='nearest',
-                align_corners=True
-            )  # [1, C, N, 1]
-            src_col = src_col.squeeze(0).squeeze(-1).permute(1, 0)  # [N, C]
-        
         video = []
         for tgt_step in tqdm(range(T), leave=False, desc="Warping first frame"):
             tgt_frame = data["video"][tgt_step]
             
-            # Get positions in target frame
-            tgt_pos = tracks[tgt_step, ..., :2]
-            tgt_vis = tracks[tgt_step, ..., 2]
+            # Get positions and visibility in target frame
+            tgt_pos = tracks[tgt_step, ..., :2]  # [H, W, 2] or [N, 2]
+            tgt_vis = tracks[tgt_step, ..., 2]   # [H, W] or [N]
             
             if tracks.ndim == 4:  # Dense tracks (T, H, W, 3)
-                tgt_pos = tgt_pos[mask]
-                tgt_vis = tgt_vis[mask]
-                
-                # Get colors from first frame using positions from first frame
-                src_pos = tracks[0, ..., :2][mask]
-                
-                # Sample colors from first frame using grid_sample (vectorized)
-                src_pos_norm = 2.0 * src_pos - 1.0  # Normalize to [-1, 1] for grid_sample
-                grid = src_pos_norm.view(1, -1, 1, 2)  # [1, N, 1, 2]
-                src_col = torch.nn.functional.grid_sample(
-                    first_frame.unsqueeze(0),  # [1, C, H, W]
-                    grid,
-                    mode='nearest',
-                    align_corners=True
-                )  # [1, C, N, 1]
-                src_col = src_col.squeeze(0).squeeze(-1).permute(1, 0)  # [N, C]
-                
+                # For dense tracks, get points in mask
+                tgt_pos_flat = tgt_pos[mask]     # [M, 2]
+                src_pos_flat = tracks[0, ..., :2][mask]  # [M, 2]
+                tgt_vis_flat = tgt_vis[mask]     # [M]
             else:  # Sparse tracks (T, N, 3)
-                pass # Already setup above
+                # For sparse tracks, use points directly
+                tgt_pos_flat = tgt_pos           # [N, 2]
+                src_pos_flat = tracks[0, :, :2]  # [N, 2] 
+                tgt_vis_flat = tgt_vis           # [N]
             
-            # Create a gray background (0.2) for warped frame
-            gray_bg = torch.ones_like(tgt_frame) * 0.2
+            # Only use visible points
+            valid = tgt_vis_flat > 0.5
+            tgt_pos_flat = tgt_pos_flat[valid]   # [V, 2]
+            src_pos_flat = src_pos_flat[valid]   # [V, 2]
             
-            # Draw just the warped points on gray background
-            warp_img = gray_bg.clone().permute(1, 2, 0)  # H, W, C
+            # Create a gray background for warped frame
+            gray_bg = torch.ones((C, H, W), device=tgt_frame.device) * 0.15
             
-            # Draw the warped points with original colors
-            if tgt_vis.bool().any():
-                # Debug color ranges - only print for first frame
-                if tgt_step == 1:
-                    print(f"Color range: {src_col.min().item():.4f} to {src_col.max().item():.4f}")
-                    print(f"Shape of src_col: {src_col.shape}")
+            if len(tgt_pos_flat) > 0:
+                # Convert normalized coordinates to pixel coordinates
+                src_x = (src_pos_flat[:, 0] * (W - 1)).clamp(0, W-1)
+                src_y = (src_pos_flat[:, 1] * (H - 1)).clamp(0, H-1)
+                tgt_x = (tgt_pos_flat[:, 0] * (W - 1)).clamp(0, W-1)
+                tgt_y = (tgt_pos_flat[:, 1] * (H - 1)).clamp(0, H-1)
                 
-                # Force color range to be visible
-                src_col = torch.clamp(src_col, 0.1, 1.0)  # Ensure nothing is completely black
+                # Sample colors from first frame (vectorized)
+                # Convert to integer coordinates
+                src_x_int = src_x.round().long()
+                src_y_int = src_y.round().long()
                 
-                # Increase the radius for better visibility
-                warp, alpha = draw(tgt_pos, tgt_vis, src_col, H, W, radius=3)  # Bigger radius for visibility
+                # Sample colors directly
+                colors = first_frame[:, src_y_int, src_x_int] * 3.0  # Brighter colors
                 
-                # Only show where we have points
-                warp_img = alpha * warp + (1-alpha) * warp_img
-            
-            warp_img = warp_img.permute(2, 0, 1)  # Back to C, H, W
+                # Create indices for target positions
+                tgt_x_int = tgt_x.round().long()
+                tgt_y_int = tgt_y.round().long()
+                
+                # Use scatter to place all colors at once (vectorized operation)
+                warp_img = gray_bg.clone()
+                
+                # Create flat indices for scatter operation
+                indices = tgt_y_int * W + tgt_x_int
+                
+                # Use scatter to place colors at all target positions at once
+                for c in range(C):
+                    flat_img = warp_img[c].view(-1)
+                    flat_img.scatter_(0, indices, colors[c])
+            else:
+                warp_img = gray_bg
             
             # Stack the original frame on top and warped frame on bottom
             combined = torch.cat([tgt_frame, warp_img], dim=1)  # Stack along height dimension
